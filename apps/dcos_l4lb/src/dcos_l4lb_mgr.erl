@@ -13,7 +13,8 @@
 -export([
     push_vips/1,
     push_netns/2,
-    local_port_mappings/1
+    local_port_mappings/1,
+    init_metrics/0
 ]).
 
 -export([start_link/0]).
@@ -166,6 +167,7 @@ handle_netns_event(_Event, State) ->
 
 -spec(handle_reconcile(state()) -> state()).
 handle_reconcile(#state{vips=VIPs, recon_ref=Ref}=State) ->
+    lager:error("Membership +1"),
     erlang:cancel_timer(Ref),
     State0 = handle_reconcile(VIPs, State),
     Ref0 = start_reconcile_timer(),
@@ -403,6 +405,9 @@ agents(VIPs, Nodes, Tree) ->
     AgentIPs0 = lists:usort(AgentIPs),
     Result = [{IP, is_reachable(IP, Nodes, Tree)} || IP <- AgentIPs0],
     Unreachable = [IP || {IP, false} <- Result],
+    lager:error("l4lb_backends_total ~p", [length(Result)]),
+    lager:error("l4lb_backends_unreachable_total ~p", [length(Unreachable)]),
+    lager:error("l4lb_backends_reachable_total ~p", [length(Result) - length(Unreachable)]),
     [ lager:warning(
         "L4LB unreachable agent nodes, size: ~p, ~p",
         [length(Unreachable), Unreachable])
@@ -582,6 +587,18 @@ local_port_mappings() ->
     catch error:badarg ->
         #{}
     end.
+
+%%%===================================================================
+%%% Metrics functions
+%%%===================================================================
+
+-spec(init_metrics() -> ok).
+init_metrics() ->
+    ok.
+
+%%%===================================================================
+%%% Test functions
+%%%===================================================================
 
 -ifdef(TEST).
 

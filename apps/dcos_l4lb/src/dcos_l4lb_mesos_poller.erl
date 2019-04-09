@@ -10,7 +10,8 @@
 
 %% API
 -export([
-    start_link/0
+    start_link/0,
+    init_metrics/0
 ]).
 
 %% gen_server callbacks
@@ -88,10 +89,20 @@ handle_poll() ->
 handle_poll(false) ->
     ok;
 handle_poll(true) ->
+    Begin = erlang:monotonic_time(),
     try dcos_net_mesos_listener:poll() of
         {error, Error} ->
+            prometheus_summary:observe(
+              l4lb, poll_request_duration_seconds,
+              [], erlang:monotonic_time() - Begin),
+            prometheus_counter:inc(
+              l4lb, poll_failures_total,
+              [], 1),
             lager:warning("Unable to poll mesos agent: ~p", [Error]);
         {ok, Tasks} ->
+            prometheus_summary:observe(
+                l4lb, poll_request_duration_seconds,
+                [], erlang:monotonic_time() - Begin),
             handle_poll_state(Tasks)
     catch error:bad_agent_id ->
         lager:warning("Mesos agent is not ready")
@@ -99,13 +110,21 @@ handle_poll(true) ->
 
 -spec(handle_poll_state(#{task_id() => task()}) -> ok).
 handle_poll_state(Tasks) ->
-    Tasks0 = maps:filter(fun is_healthy/2, Tasks),
+    Begin = erlang:monotonic_time(),
+    HealthyTasks = maps:filter(fun is_healthy/2, Tasks),
+    prometheus_gauge:set(l4lb, poll_tasks_total, [], maps:size(Tasks)),
+    prometheus_gauge:set(
+        l4lb, poll_healthy_tasks_total,
+        [], maps:size(HealthyTasks)),
 
-    PortMappings = collect_port_mappings(Tasks0),
+    PortMappings = collect_port_mappings(HealthyTasks),
     dcos_l4lb_mgr:local_port_mappings(PortMappings),
 
-    VIPs = collect_vips(Tasks0),
-    ok = push_vips(VIPs).
+    VIPs = collect_vips(HealthyTasks),
+    ok = push_vips(VIPs),
+    prometheus_summary:observe(
+      l4lb, poll_process_duration_seconds,
+      [], erlang:monotonic_time() - Begin).
 
 -spec(is_healthy(task_id(), task()) -> boolean()).
 is_healthy(_TaskId, Task) ->
@@ -220,6 +239,9 @@ push_vips(LocalVIPs) ->
     VIPs = lashup_kv:value(?VIPS_KEY2),
     Ops = generate_ops(LocalVIPs, VIPs),
     push_ops(?VIPS_KEY2, Ops),
+    VIPsWritten = lashup_kv:value(?VIPS_KEY2),
+    prometheus_counter:inc(l4lb, events_updates_total, [], 1),
+    prometheus_gauge:set(l4lb, vips_total, [], length(VIPsWritten)),
     log_ops(Ops).
 
 -spec(generate_ops(#{key() => [backend()]}, [{lkey(), [backend()]}]) ->
@@ -284,6 +306,53 @@ log_ops(Key, {remove_all, Backends}) ->
     lists:foreach(fun ({_AgentIP, Backend}) ->
         lager:notice("VIP updated: ~p, removed: ~p", [Key, Backend])
     end, Backends).
+
+
+%%%===================================================================
+%%% Metrics functions
+%%%===================================================================
+
+-spec(init_metrics() -> ok).
+init_metrics() ->
+    init_poll_metrics(),
+    prometheus_counter:new([
+        {registry, l4lb},
+        {name, events_updates_total},
+        {labels, []},
+        {help, "Total number of update events triggered"}]),
+    prometheus_gauge:new([
+        {registry, l4lb},
+        {name, vips_total},
+        {labels, []},
+        {help, "Total number of VIPs"}]),
+    ok.
+
+init_poll_metrics() ->
+    prometheus_gauge:new([
+       {registry, l4lb},
+       {name, poll_healthy_tasks_total},
+       {labels, []},
+       {help, "Total number of healthy tasks"}]),
+    prometheus_counter:new([
+       {registry, l4lb},
+       {name, poll_failures_total},
+       {labels, []},
+       {help, "Total number of poll errors"}]),
+    prometheus_summary:new([
+       {registry, l4lb},
+       {name, poll_process_duration_seconds},
+       {labels, []},
+       {help, "Time to process state from mesos"}]),
+    prometheus_summary:new([
+       {registry, l4lb},
+       {name, poll_request_duration_seconds},
+       {labels, []},
+       {help, "Time to request state from mesos"}]),
+    prometheus_gauge:new([
+       {registry, l4lb},
+       {name, poll_tasks_total},
+       {labels, []},
+       {help, "Total number of tasks"}]).
 
 %%%===================================================================
 %%% Test functions
