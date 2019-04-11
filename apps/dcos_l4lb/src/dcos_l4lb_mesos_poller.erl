@@ -112,9 +112,9 @@ handle_poll(true) ->
 handle_poll_state(Tasks) ->
     Begin = erlang:monotonic_time(),
     HealthyTasks = maps:filter(fun is_healthy/2, Tasks),
-    prometheus_gauge:set(l4lb, poll_tasks_total, [], maps:size(Tasks)),
+    prometheus_gauge:set(l4lb, local_tasks_total, [], maps:size(Tasks)),
     prometheus_gauge:set(
-        l4lb, poll_healthy_tasks_total,
+        l4lb, local_healthy_tasks_total,
         [], maps:size(HealthyTasks)),
 
     PortMappings = collect_port_mappings(HealthyTasks),
@@ -202,7 +202,7 @@ key(Task, PortObj, VIPLabel) ->
 backends(Key, Task, PortObj) ->
     IsIPv6Enabled = application:get_env(dcos_l4lb, enable_ipv6, true),
     AgentIP = maps:get(agent_ip, Task),
-    case maps:find(host_port, PortObj) of
+    Backends = case maps:find(host_port, PortObj) of
         error ->
             Port = maps:get(port, PortObj),
             [ {AgentIP, {TaskIP, Port}}
@@ -210,7 +210,9 @@ backends(Key, Task, PortObj) ->
                validate_backend_ip(IsIPv6Enabled, Key, TaskIP) ];
         {ok, HostPort} ->
             [{AgentIP, {AgentIP, HostPort}}]
-    end.
+    end,
+    prometheus_gauge:set(l4lb, local_backends_total, [], Backends),
+    Backends.
 
 -spec(validate_backend_ip(boolean(), key(), inet:ip_address()) -> boolean()).
 validate_backend_ip(true, {_Protocol, {name, _Name}, _VIPPort}, _TaskIP) ->
@@ -239,9 +241,8 @@ push_vips(LocalVIPs) ->
     VIPs = lashup_kv:value(?VIPS_KEY2),
     Ops = generate_ops(LocalVIPs, VIPs),
     push_ops(?VIPS_KEY2, Ops),
-    VIPsWritten = lashup_kv:value(?VIPS_KEY2),
+    prometheus_gauge:set(l4lb, local_vips_total, [], maps:size(LocalVIPs)),
     prometheus_counter:inc(l4lb, events_updates_total, [], 1),
-    prometheus_gauge:set(l4lb, vips_total, [], length(VIPsWritten)),
     log_ops(Ops).
 
 -spec(generate_ops(#{key() => [backend()]}, [{lkey(), [backend()]}]) ->
@@ -314,45 +315,44 @@ log_ops(Key, {remove_all, Backends}) ->
 
 -spec(init_metrics() -> ok).
 init_metrics() ->
-    init_poll_metrics(),
+    init_local_metrics(),
+    % looks like the metrics bellow this line should be gone
     prometheus_counter:new([
         {registry, l4lb},
-        {name, events_updates_total},
-        {labels, []},
-        {help, "Total number of update events triggered"}]),
-    prometheus_gauge:new([
-        {registry, l4lb},
-        {name, vips_total},
-        {labels, []},
-        {help, "Total number of VIPs"}]),
-    ok.
-
-init_poll_metrics() ->
-    prometheus_gauge:new([
-       {registry, l4lb},
-       {name, poll_healthy_tasks_total},
-       {labels, []},
-       {help, "Total number of healthy tasks"}]),
+        {name, events_updates},
+        {help, "Total number of update events triggered."}]),
     prometheus_counter:new([
        {registry, l4lb},
        {name, poll_failures_total},
-       {labels, []},
-       {help, "Total number of poll errors"}]),
+       {help, "Total number of poll errors."}]),
     prometheus_summary:new([
        {registry, l4lb},
        {name, poll_process_duration_seconds},
-       {labels, []},
-       {help, "Time to process state from mesos"}]),
+       {help, "Time to process state from mesos."}]),
     prometheus_summary:new([
        {registry, l4lb},
        {name, poll_request_duration_seconds},
-       {labels, []},
-       {help, "Time to request state from mesos"}]),
+       {help, "Time to request state from mesos."}]).
+
+% fix gauges that are named total
+init_local_metrics() ->
     prometheus_gauge:new([
        {registry, l4lb},
-       {name, poll_tasks_total},
-       {labels, []},
-       {help, "Total number of tasks"}]).
+       {name, local_tasks},
+       {help, "Current number of local tasks."}]),
+    prometheus_gauge:new([
+       {registry, l4lb},
+       {name, local_healthy_tasks},
+       {help, "Current number of local healthy tasks."}]),
+    prometheus_gauge:new([
+        {registry, l4lb},
+        {name, local_vips},
+        {help, "Current number of local VIPs."}]),
+    prometheus_gauge:new([
+        {registry, l4lb},
+        {name, local_backends},
+        {help, "Current number of local Backends."}]).
+
 
 %%%===================================================================
 %%% Test functions
